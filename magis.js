@@ -550,19 +550,128 @@ var sessionStarting = !1,
   sessionWaiters = [],
   sessionRejectUntil = 0;
 var pendingRegistration = null;
+
+function makeActivationFingerprint() {
+  var fingerprint = {};
+  for (var key in FINGERPRINT_FIXED)
+    if (Object.prototype.hasOwnProperty.call(FINGERPRINT_FIXED, key))
+      fingerprint[key] = FINGERPRINT_FIXED[key];
+  fingerprint.androidId = randomHex(8);
+  fingerprint.cpuId = randomHex(8);
+  fingerprint.serialNumber = randomHex(8);
+  fingerprint.etheMac = randomHex(6).replace(/(..)(?=.)/g, "$1:");
+  fingerprint.gatewayMac = randomHex(6).replace(/(..)(?=.)/g, "$1:");
+  fingerprint.wifiMac = randomHex(6).replace(/(..)(?=.)/g, "$1:");
+  /* v3/snToken crea un identificador nuevo; no reutiliza el sn de otra sesión. */
+  fingerprint.sn = "";
+  return fingerprint;
+}
+
+/*
+ * Activa un dispositivo propio. Se usa tanto para la sesión normal como para
+ * la sesión temporal de registro. No lee ni adopta tokens de otros usuarios.
+ */
+function activateOwnDevice(callback) {
+  callback = callback || function () {};
+  var fingerprint = makeActivationFingerprint();
+  call(
+    "v3/snToken",
+    fingerprint,
+    { baseFields: !1, urgent: !0, _sessionRetried: !0 },
+    function (err, minted) {
+      if (err) return callback(err);
+      var snToken = trim(minted && minted.snToken);
+      if (!snToken)
+        return callback(new Error("v3/snToken: el portal no devolvió snToken."));
+      var sn = trim(minted && minted.sn);
+      if (!sn)
+        sn = crypto.createHash("md5").update(snToken + SNTOKEN_SALT).digest("hex");
+      sn = String(sn).toLowerCase();
+
+      call(
+        "v8/active",
+        {
+          sn: sn,
+          snToken: snToken,
+          authVersion: "",
+          authCode: "",
+          preCode: "",
+          macAddr: FIXED_MAC,
+          reserve1: "",
+          openNum: 4,
+          channel: "default",
+          matadata: "",
+          signdata: ""
+        },
+        { baseFields: !1, urgent: !0, _sessionRetried: !0 },
+        function (activeError, activated) {
+          if (activeError) return callback(activeError);
+          var userId = trim(activated && activated.userId);
+          var userToken = trim(activated && activated.userToken);
+          if (!userId || !userToken)
+            return callback(new Error("v8/active: el portal no devolvió userId y userToken."));
+          callback(null, {
+            sn: sn,
+            snToken: snToken,
+            userId: userId,
+            userToken: userToken
+          });
+        }
+      );
+    }
+  );
+}
+
+function finishSessionActivation(err, activated) {
+  if (err) {
+    session.ready = !1;
+    session.userId = "";
+    session.userToken = "";
+    session.snToken = "";
+    session.usesSeed = !1;
+    session.at = 0;
+    session.lastError = err.message || String(err);
+  } else {
+    session.sn = activated.sn;
+    session.snToken = activated.snToken;
+    session.userId = activated.userId;
+    session.userToken = activated.userToken;
+    session.ready = !0;
+    session.usesSeed = !1;
+    session.at = Date.now();
+    session.lastError = "";
+    sessionRejectUntil = 0;
+  }
+  sessionStarting = !1;
+  sessionActTries = 0;
+  var waiters = sessionWaiters.slice();
+  sessionWaiters = [];
+  for (var i = 0; i < waiters.length; i++) {
+    try { waiters[i](err || null, err ? null : session); } catch (callbackError) {}
+  }
+}
+
 function ensureSession(e) {
   e = e || function () {};
   var now = Date.now();
   if (session.ready && session.userId && session.userToken) {
-    if (!session.at || now - session.at < SESSION_MAX_AGE_MS) return e(null, session);
-    session.ready = !1;
-    session.userId = "";
-    session.userToken = "";
-    session.lastError = "La sesión Xuper expiró. Inicia sesión de nuevo con tu cuenta.";
+    if (!session.at || now - session.at < SESSION_MAX_AGE_MS)
+      return e(null, session);
+    session.lastError = "La sesión Xuper expiró. Renovando la activación del dispositivo.";
   }
-  var err = new Error(session.lastError || "Inicia sesión con una cuenta Xuper existente para acceder a sus servidores. La activación automática v3/snToken está deshabilitada.");
-  err.code = "AUTH_REQUIRED";
-  return e(err);
+  sessionWaiters.push(e);
+  if (sessionStarting) return;
+  sessionStarting = !0;
+  session.ready = !1;
+  session.sn = "";
+  session.snToken = "";
+  session.userId = "";
+  session.userToken = "";
+  session.usesSeed = !1;
+  session.at = 0;
+  activateOwnDevice(function (err, activated) {
+    finishSessionActivation(err, activated);
+  });
 }
 
 function validAccountEmail(email) {
@@ -604,37 +713,155 @@ function adoptAccountSession(result, sn) {
   liveResolveCache = {};
   return null;
 }
+
 function loginWithAccount(email, password, callback) {
   callback = callback || function () {};
   email = trim(email).toLowerCase();
   password = text(password);
-  if (!validAccountEmail(email)) return callback(new Error("Escribe un correo electrónico válido."));
-  if (!password) return callback(new Error("Escribe la contraseña de tu cuenta Xuper."));
-  var bean = loginBean(email, password, session.sn);
-  call("v8/login", bean, { baseFields: !1, urgent: !0, _sessionRetried: !0 }, function (err, result) {
-    if (err) {
-      session.lastError = "v8/login: " + (err.message || String(err));
-      return callback(err);
-    }
-    var adoptError = adoptAccountSession(result, session.sn);
-    if (adoptError) return callback(adoptError);
-    console.log("[magis] inicio de sesión propio aceptado por v8/login");
-    callback(null, { loggedIn: !0 });
+  if (!validAccountEmail(email))
+    return callback(new Error("Escribe un correo electrónico válido."));
+  if (!password)
+    return callback(new Error("Escribe la contraseña de tu cuenta Xuper."));
+
+  ensureSession(function (sessionError) {
+    if (sessionError) return callback(sessionError);
+    var bean = loginBean(email, password, session.sn);
+    call(
+      "v8/login",
+      bean,
+      { baseFields: !1, urgent: !0, _sessionRetried: !0 },
+      function (err, result) {
+        if (err) {
+          session.lastError = "v8/login: " + (err.message || String(err));
+          return callback(err);
+        }
+        var adoptError = adoptAccountSession(result, session.sn);
+        if (adoptError) return callback(adoptError);
+        console.log("[magis] inicio de sesión propio aceptado por v8/login");
+        callback(null, { loggedIn: !0 });
+      }
+    );
   });
 }
+
 function sendRegistrationCode(email, callback) {
   callback = callback || function () {};
-  var err = new Error("El registro por correo está deshabilitado temporalmente: Xuper rechaza v3/snToken. Usa una cuenta existente.");
-  err.code = "REGISTRATION_DISABLED";
-  session.lastError = err.message;
-  callback(err);
+  email = trim(email).toLowerCase();
+  if (!validAccountEmail(email))
+    return callback(new Error("Escribe un correo electrónico válido."));
+
+  /* El registro usa un dispositivo temporal independiente de la sesión abierta. */
+  activateOwnDevice(function (activationError, temporary) {
+    if (activationError) return callback(activationError);
+    var pending = {
+      email: email,
+      userId: temporary.userId,
+      userToken: temporary.userToken,
+      sn: temporary.sn,
+      at: Date.now()
+    };
+    call(
+      "v2/sendEmailVerifyCode",
+      {
+        email: email,
+        type: "1",
+        userId: pending.userId,
+        userToken: pending.userToken,
+        sn: pending.sn
+      },
+      { baseFields: !1, urgent: !0, _sessionRetried: !0 },
+      function (err) {
+        if (err) return callback(err);
+        pendingRegistration = pending;
+        callback(null, { codeSent: !0 });
+      }
+    );
+  });
 }
+
 function confirmEmailRegistration(email, code, password, callback) {
   callback = callback || function () {};
-  var err = new Error("El registro por correo está deshabilitado temporalmente.");
-  err.code = "REGISTRATION_DISABLED";
-  callback(err);
+  email = trim(email).toLowerCase();
+  code = trim(code);
+  password = text(password);
+  if (!validAccountEmail(email))
+    return callback(new Error("Escribe un correo electrónico válido."));
+  if (!code)
+    return callback(new Error("Escribe el código recibido por correo."));
+  if (!password)
+    return callback(new Error("Escribe una contraseña para tu cuenta."));
+
+  var pending = pendingRegistration;
+  if (
+    !pending ||
+    pending.email !== email ||
+    !pending.at ||
+    Date.now() - pending.at > 30 * 60 * 1000
+  ) {
+    pendingRegistration = null;
+    return callback(new Error("La solicitud de registro venció. Solicita un código nuevo."));
+  }
+
+  var options = { baseFields: !1, urgent: !0, _sessionRetried: !0 };
+  var passwordHash = accountPasswordHash(password);
+
+  call(
+    "v2/validateVerifyCode",
+    {
+      type: "1",
+      email: email,
+      verifyCode: code,
+      userToken: pending.userToken,
+      userId: pending.userId,
+      sn: pending.sn
+    },
+    options,
+    function (validateError) {
+      if (validateError) return callback(validateError);
+      call(
+        "v2/bindEmail",
+        {
+          email: email,
+          pwd: passwordHash,
+          type: "1",
+          userId: pending.userId,
+          userToken: pending.userToken,
+          sn: pending.sn
+        },
+        options,
+        function (bindError) {
+          if (bindError) return callback(bindError);
+          /* El código ya fue consumido; desde aquí la cuenta quedó vinculada. */
+          pendingRegistration = null;
+          var bean = loginBean(email, password, pending.sn);
+          call(
+            "v8/login",
+            bean,
+            options,
+            function (loginError, result) {
+              if (loginError) {
+                session.lastError =
+                  "La cuenta se creó, pero el inicio de sesión automático falló: " +
+                  (loginError.message || String(loginError));
+                return callback(new Error(session.lastError));
+              }
+              var adoptError = adoptAccountSession(result, pending.sn);
+              if (adoptError) {
+                session.lastError =
+                  "La cuenta se creó, pero no se pudo iniciar sesión: " +
+                  adoptError.message;
+                return callback(new Error(session.lastError));
+              }
+              console.log("[magis] registro por correo y v8/login completados");
+              callback(null, { registered: !0, loggedIn: !0 });
+            }
+          );
+        }
+      );
+    }
+  );
 }
+
 function logoutAccount(callback) {
   callback = callback || function () {};
   session.userId = "";
