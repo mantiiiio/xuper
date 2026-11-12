@@ -1,5 +1,5 @@
 "use strict";
-/* XUPER_PC_NO_V3_AUTO_ACTIVATION_PATCH */
+/* XUPER_PC_V3_SNTOKEN_REGISTRATION_RESTORED */
 var crypto = require("crypto"),
   https = require("https"),
   http = require("http"),
